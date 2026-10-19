@@ -49,12 +49,14 @@ import json
 import os
 import sys
 import urllib.parse
+import urllib.error
 import urllib.request
 
 import numpy as np
 import pandas as pd
 
 IST = "Asia/Kolkata"
+SEND_FAILURES = []   # any failed Telegram send makes the run exit with an error
 
 CFG = dict(
     ema_fast=5, ema_mid=13, ema_slow=26,
@@ -331,14 +333,20 @@ def send_telegram(text: str) -> bool:
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         print("[alert] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set. Message would have been:\n" + text)
+        SEND_FAILURES.append(1)
         return False
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
     try:
         urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=15)
+        print("[alert] Telegram message sent:\n" + text)
         return True
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"[alert] Telegram send FAILED ({e.code}): {body}", file=sys.stderr)
     except Exception as e:
-        print(f"[alert] Telegram send failed: {e}", file=sys.stderr)
-        return False
+        print(f"[alert] Telegram send FAILED: {e}", file=sys.stderr)
+    SEND_FAILURES.append(1)
+    return False
 
 
 def market_hours_now() -> bool:
@@ -476,11 +484,4 @@ def main():
     p.add_argument("--alert", action="store_true", help="send new signals to Telegram")
     p.add_argument("--test-alert", action="store_true", help="send one test message to Telegram and exit")
     p.add_argument("--summary", action="store_true",
-                   help="send a summary of every signal that fired today")
-    p.add_argument("--snapshot", action="store_true",
-                   help="send the current status of every symbol to Telegram (manual check)")
-    p.add_argument("--force", action="store_true", help="with --alert, run even outside market hours")
-    p.add_argument("--state", default="sent_signals.json", help="file that remembers sent alerts")
-    args = p.parse_args()
-
-    
+                   help="send a summary of every signal that fired tod

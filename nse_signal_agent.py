@@ -32,7 +32,8 @@ Telegram alerts (used by the GitHub Actions workflow):
   python nse_signal_agent.py --test-alert                     # send a test message
   python nse_signal_agent.py --alert --strategy 1             # send only NEW signals
   python nse_signal_agent.py --snapshot                       # send current status of every stock
-  --alert only runs during market hours (Mon-Fri 09:20-15:35 IST) unless --force is given,
+  python nse_signal_agent.py --summary                        # send today's signal summary
+  --alert only runs during market hours (Mon-Fri 09:20-16:00 IST) unless --force is given,
   and remembers what it already sent in sent_signals.json so you don't get repeats.
 
 Notes:
@@ -342,7 +343,7 @@ def send_telegram(text: str) -> bool:
 
 def market_hours_now() -> bool:
     now = pd.Timestamp.now(tz=IST)
-    return now.weekday() < 5 and "09:20" <= now.strftime("%H:%M") <= "15:35"
+    return now.weekday() < 5 and "09:20" <= now.strftime("%H:%M") <= "16:00"
 
 
 def load_state(path: str) -> set:
@@ -376,7 +377,7 @@ def alert_text(sym, ts, row, strategy) -> str:
     )
 
 
-def new_signals(sym, df5, strategy, sent: set, lookback_min: int = 15):
+def new_signals(sym, df5, strategy, sent: set, lookback_min: int = 90):
     """Signals on candles that closed in the last `lookback_min` minutes and weren't sent yet."""
     now = pd.Timestamp.now(tz=IST)
     recent = df5[(df5["signal"] != 0) &
@@ -407,6 +408,30 @@ def snapshot_text(rows, strategy, n_requested) -> str:
     if len(rows) < n_requested:
         lines.append(f"\n({n_requested - len(rows)} symbol(s) had no data)")
     lines.append(f"\nCandle used: {rows[0]['candle']} (last completed 5m)")
+    return "\n".join(lines)
+
+
+def signals_today(sym, df5):
+    today = pd.Timestamp.now(tz=IST).date()
+    hits = df5[(df5["signal"] != 0) & (df5.index.date == today)]
+    return [(sym, ts, "BUY" if r["signal"] > 0 else "SELL", r["Close"]) for ts, r in hits.iterrows()]
+
+
+def summary_text(sigs, strategy, n_ok, n_requested) -> str:
+    day = pd.Timestamp.now(tz=IST).strftime("%a %d-%b")
+    name = {1: "Momentum", 2: "Pullback"}[strategy]
+    lines = [f"📋 Day summary {day}  (Strategy {strategy}: {name})", ""]
+    if n_ok == 0:
+        lines.append("⚠️ No market data could be fetched today. Check the GitHub Actions log.")
+    elif not sigs:
+        lines.append(f"No signals today. Checked {n_ok} stocks; none met all the conditions.")
+    else:
+        lines.append(f"{len(sigs)} signal(s) today:")
+        for sym, ts, side, close in sorted(sigs, key=lambda x: x[1]):
+            icon = "🟢" if side == "BUY" else "🔴"
+            lines.append(f"{icon} {ts.strftime('%H:%M')}  {side} {sym} @ {close:.2f}")
+    if 0 < n_ok < n_requested:
+        lines.append(f"\n({n_requested - n_ok} symbol(s) had no data)")
     return "\n".join(lines)
 
 
@@ -450,100 +475,12 @@ def main():
     p.add_argument("--demo", action="store_true", help="use synthetic data (no internet needed)")
     p.add_argument("--alert", action="store_true", help="send new signals to Telegram")
     p.add_argument("--test-alert", action="store_true", help="send one test message to Telegram and exit")
+    p.add_argument("--summary", action="store_true",
+                   help="send a summary of every signal that fired today")
     p.add_argument("--snapshot", action="store_true",
                    help="send the current status of every symbol to Telegram (manual check)")
     p.add_argument("--force", action="store_true", help="with --alert, run even outside market hours")
     p.add_argument("--state", default="sent_signals.json", help="file that remembers sent alerts")
     args = p.parse_args()
 
-    pd.set_option("display.width", 200)
-    pd.set_option("display.max_columns", 20)
-
-    if args.test_alert:
-        now = pd.Timestamp.now(tz=IST).strftime("%d-%b %H:%M")
-        ok = send_telegram(f"✅ NSE signal agent is connected ({now} IST).\n"
-                           f"Watching: {', '.join(args.symbols)}")
-        print("Test message sent." if ok else "Test message NOT sent.")
-        sys.exit(0 if ok else 1)
-
-    sent = set()
-    if args.alert:
-        sent = load_state(args.state)
-        if not args.force and not market_hours_now():
-            print("Outside market hours (Mon-Fri 09:20-15:35 IST). Nothing to do.")
-            save_state(args.state, sent)
-            return
-
-    rows, all_trades, alerts = [], [], []
-    for n_sym, sym in enumerate(args.symbols):
-        ysym = to_yahoo(sym)
-        try:
-            if args.demo:
-                df5_raw, df15_raw = demo_data(seed=n_sym)
-            else:
-                period = "10d" if args.alert else "59d"   # alerts only need recent history
-                df5_raw = fetch(ysym, "5m", period)
-                df15_raw = fetch(ysym, "15m", period)
-                if not args.backtest:
-                    df5_raw = drop_forming_candle(df5_raw, 5)
-                    df15_raw = drop_forming_candle(df15_raw, 15)
-            if df5_raw.empty or df15_raw.empty:
-                print(f"[skip] {ysym}: no data", file=sys.stderr)
-                continue
-            df5, _ = build(df5_raw, df15_raw, args.strategy)
-        except Exception as e:  # keep scanning other symbols
-            print(f"[error] {ysym}: {e}", file=sys.stderr)
-            continue
-
-        if args.backtest:
-            tr = backtest(df5, args.hold, args.cost)
-            if not tr.empty:
-                tr.insert(0, "symbol", sym)
-                all_trades.append(tr)
-            rows.append({"symbol": sym, **summarize(tr)})
-        else:
-            rows.append(describe_last(sym, df5))
-            if args.alert:
-                alerts += new_signals(sym, df5, args.strategy, sent)
-
-    if args.alert:
-        today = pd.Timestamp.now(tz=IST).strftime("%Y-%m-%d")
-        if not rows and f"datafail|{today}" not in sent:
-            # warn once a day if every symbol failed (e.g. Yahoo blocking the server)
-            if send_telegram("⚠️ NSE signal agent could not fetch market data today. Check the GitHub Actions log."):
-                sent.add(f"datafail|{today}")
-        for key, text in alerts:
-            if send_telegram(text):
-                sent.add(key)
-        save_state(args.state, sent)
-        print(f"{len(alerts)} new signal(s) found.")
-
-    if args.snapshot:
-        send_telegram(snapshot_text(rows, args.strategy, len(args.symbols)))
-
-    if not rows:
-        print("No results. Check your internet connection or symbols.")
-        return
-
-    name = {1: "Momentum crossover", 2: "Pullback in trend"}[args.strategy]
-    print(f"\nStrategy {args.strategy}: {name}" + ("  [DEMO DATA]" if args.demo else ""))
-
-    if args.backtest:
-        print(f"Hold {args.hold} x 5m candles, cost {args.cost}% per round trip\n")
-        print(pd.DataFrame(rows).fillna("").to_string(index=False))
-        if all_trades:
-            trades = pd.concat(all_trades, ignore_index=True)
-            print("\nAll symbols combined:")
-            for k, v in summarize(trades).items():
-                print(f"  {k:<15} {v}")
-            if args.csv:
-                trades.to_csv(args.csv, index=False)
-                print(f"\nTrades saved to {args.csv}")
-        print("\nReminder: ~60 days of data is a small sample. Paper-trade before going live.")
-    else:
-        print("15m = trend filter, 5m = entry. Signal shown for the last completed candle.\n")
-        print(pd.DataFrame(rows).to_string(index=False))
-
-
-if __name__ == "__main__":
-    main()
+    

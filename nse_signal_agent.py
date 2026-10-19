@@ -31,6 +31,7 @@ Telegram alerts (used by the GitHub Actions workflow):
   set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables, then
   python nse_signal_agent.py --test-alert                     # send a test message
   python nse_signal_agent.py --alert --strategy 1             # send only NEW signals
+  python nse_signal_agent.py --snapshot                       # send current status of every stock
   --alert only runs during market hours (Mon-Fri 09:20-15:35 IST) unless --force is given,
   and remembers what it already sent in sent_signals.json so you don't get repeats.
 
@@ -388,6 +389,27 @@ def new_signals(sym, df5, strategy, sent: set, lookback_min: int = 15):
     return out
 
 
+def snapshot_text(rows, strategy, n_requested) -> str:
+    now = pd.Timestamp.now(tz=IST).strftime("%d-%b %H:%M")
+    name = {1: "Momentum", 2: "Pullback"}[strategy]
+    lines = [f"📊 Snapshot {now} IST  (Strategy {strategy}: {name})", ""]
+    if not rows:
+        lines.append("⚠️ No market data could be fetched. Check the GitHub Actions log.")
+        return "\n".join(lines)
+    trend_icon = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪"}
+    for r in rows:
+        sig = "" if r["signal_5m"] == "-" else f"  ➜ {r['signal_5m']} NOW"
+        recent = "" if r["last_30min"] == "-" else f"  (last 30m: {r['last_30min']})"
+        lines.append(
+            f"{trend_icon.get(r['trend_15m'], '')} {r['symbol']}  {r['close']}  "
+            f"15m {r['trend_15m']}  Stoch {r['stoch_k/d']}  Vol {r['vol_x_avg']}x{sig}{recent}"
+        )
+    if len(rows) < n_requested:
+        lines.append(f"\n({n_requested - len(rows)} symbol(s) had no data)")
+    lines.append(f"\nCandle used: {rows[0]['candle']} (last completed 5m)")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -428,6 +450,8 @@ def main():
     p.add_argument("--demo", action="store_true", help="use synthetic data (no internet needed)")
     p.add_argument("--alert", action="store_true", help="send new signals to Telegram")
     p.add_argument("--test-alert", action="store_true", help="send one test message to Telegram and exit")
+    p.add_argument("--snapshot", action="store_true",
+                   help="send the current status of every symbol to Telegram (manual check)")
     p.add_argument("--force", action="store_true", help="with --alert, run even outside market hours")
     p.add_argument("--state", default="sent_signals.json", help="file that remembers sent alerts")
     args = p.parse_args()
@@ -493,6 +517,9 @@ def main():
                 sent.add(key)
         save_state(args.state, sent)
         print(f"{len(alerts)} new signal(s) found.")
+
+    if args.snapshot:
+        send_telegram(snapshot_text(rows, args.strategy, len(args.symbols)))
 
     if not rows:
         print("No results. Check your internet connection or symbols.")

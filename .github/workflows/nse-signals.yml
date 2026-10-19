@@ -3,8 +3,10 @@ name: NSE signal alerts
 on:
   schedule:
     # Every 5 minutes, 03:00-10:59 UTC = 08:30-16:29 IST, Monday-Friday.
-    # The script itself skips anything outside 09:20-15:35 IST.
+    # The script itself skips anything outside 09:20-16:00 IST.
     - cron: "*/5 3-10 * * 1-5"
+    # Day summary at 10:40 UTC = 16:10 IST, Monday-Friday.
+    - cron: "40 10 * * 1-5"
   workflow_dispatch:        # "Run workflow" button for manual tests
     inputs:
       mode:
@@ -14,6 +16,7 @@ on:
         options:
           - snapshot        # send current status of every stock to Telegram
           - signals         # check for new BUY/SELL signals now (even outside market hours)
+          - summary         # list every signal that fired today
           - test            # just send a "connected" message
 
 permissions:
@@ -62,8 +65,16 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'signals'
         run: python nse_signal_agent.py --alert --force --strategy "$STRATEGY" ${SYMBOLS:+--symbols $SYMBOLS}
 
+      - name: Manual - day summary
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'summary'
+        run: python nse_signal_agent.py --summary --strategy "$STRATEGY" ${SYMBOLS:+--symbols $SYMBOLS}
+
+      - name: Scheduled - day summary
+        if: github.event_name == 'schedule' && github.event.schedule == '40 10 * * 1-5'
+        run: python nse_signal_agent.py --summary --strategy "$STRATEGY" ${SYMBOLS:+--symbols $SYMBOLS}
+
       - name: Scheduled - scan and alert
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' && github.event.schedule != '40 10 * * 1-5'
         run: python nse_signal_agent.py --alert --strategy "$STRATEGY" ${SYMBOLS:+--symbols $SYMBOLS}
 
       - name: Save list of alerts already sent
@@ -72,3 +83,4 @@ jobs:
         with:
           path: sent_signals.json
           key: sent-signals-${{ github.run_id }}
+          

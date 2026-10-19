@@ -83,4 +83,3 @@ jobs:
         with:
           path: sent_signals.json
           key: sent-signals-${{ github.run_id }}
-          

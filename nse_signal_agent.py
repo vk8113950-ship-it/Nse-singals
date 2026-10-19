@@ -49,14 +49,12 @@ import json
 import os
 import sys
 import urllib.parse
-import urllib.error
 import urllib.request
 
 import numpy as np
 import pandas as pd
 
 IST = "Asia/Kolkata"
-SEND_FAILURES = []   # any failed Telegram send makes the run exit with an error
 
 CFG = dict(
     ema_fast=5, ema_mid=13, ema_slow=26,
@@ -333,20 +331,14 @@ def send_telegram(text: str) -> bool:
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         print("[alert] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set. Message would have been:\n" + text)
-        SEND_FAILURES.append(1)
         return False
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
     try:
         urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=15)
-        print("[alert] Telegram message sent:\n" + text)
         return True
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        print(f"[alert] Telegram send FAILED ({e.code}): {body}", file=sys.stderr)
     except Exception as e:
-        print(f"[alert] Telegram send FAILED: {e}", file=sys.stderr)
-    SEND_FAILURES.append(1)
-    return False
+        print(f"[alert] Telegram send failed: {e}", file=sys.stderr)
+        return False
 
 
 def market_hours_now() -> bool:
@@ -484,4 +476,106 @@ def main():
     p.add_argument("--alert", action="store_true", help="send new signals to Telegram")
     p.add_argument("--test-alert", action="store_true", help="send one test message to Telegram and exit")
     p.add_argument("--summary", action="store_true",
-                   help="send a summary of every signal that fired tod
+                   help="send a summary of every signal that fired today")
+    p.add_argument("--snapshot", action="store_true",
+                   help="send the current status of every symbol to Telegram (manual check)")
+    p.add_argument("--force", action="store_true", help="with --alert, run even outside market hours")
+    p.add_argument("--state", default="sent_signals.json", help="file that remembers sent alerts")
+    args = p.parse_args()
+
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_columns", 20)
+
+    if args.test_alert:
+        now = pd.Timestamp.now(tz=IST).strftime("%d-%b %H:%M")
+        ok = send_telegram(f"✅ NSE signal agent is connected ({now} IST).\n"
+                           f"Watching: {', '.join(args.symbols)}")
+        print("Test message sent." if ok else "Test message NOT sent.")
+        sys.exit(0 if ok else 1)
+
+    sent = set()
+    if args.alert:
+        sent = load_state(args.state)
+        if not args.force and not market_hours_now():
+            print("Outside market hours (Mon-Fri 09:20-16:00 IST). Nothing to do.")
+            save_state(args.state, sent)
+            return
+
+    rows, all_trades, alerts, today_sigs = [], [], [], []
+    for n_sym, sym in enumerate(args.symbols):
+        ysym = to_yahoo(sym)
+        try:
+            if args.demo:
+                df5_raw, df15_raw = demo_data(seed=n_sym)
+            else:
+                period = "10d" if args.alert else "59d"   # alerts only need recent history
+                df5_raw = fetch(ysym, "5m", period)
+                df15_raw = fetch(ysym, "15m", period)
+                if not args.backtest:
+                    df5_raw = drop_forming_candle(df5_raw, 5)
+                    df15_raw = drop_forming_candle(df15_raw, 15)
+            if df5_raw.empty or df15_raw.empty:
+                print(f"[skip] {ysym}: no data", file=sys.stderr)
+                continue
+            df5, _ = build(df5_raw, df15_raw, args.strategy)
+        except Exception as e:  # keep scanning other symbols
+            print(f"[error] {ysym}: {e}", file=sys.stderr)
+            continue
+
+        if args.backtest:
+            tr = backtest(df5, args.hold, args.cost)
+            if not tr.empty:
+                tr.insert(0, "symbol", sym)
+                all_trades.append(tr)
+            rows.append({"symbol": sym, **summarize(tr)})
+        else:
+            rows.append(describe_last(sym, df5))
+            if args.alert:
+                alerts += new_signals(sym, df5, args.strategy, sent)
+            if args.summary:
+                today_sigs += signals_today(sym, df5)
+
+    if args.alert:
+        today = pd.Timestamp.now(tz=IST).strftime("%Y-%m-%d")
+        if not rows and f"datafail|{today}" not in sent:
+            # warn once a day if every symbol failed (e.g. Yahoo blocking the server)
+            if send_telegram("⚠️ NSE signal agent could not fetch market data today. Check the GitHub Actions log."):
+                sent.add(f"datafail|{today}")
+        for key, text in alerts:
+            if send_telegram(text):
+                sent.add(key)
+        save_state(args.state, sent)
+        print(f"{len(alerts)} new signal(s) found.")
+
+    if args.summary:
+        send_telegram(summary_text(today_sigs, args.strategy, len(rows), len(args.symbols)))
+
+    if args.snapshot:
+        send_telegram(snapshot_text(rows, args.strategy, len(args.symbols)))
+
+    if not rows:
+        print("No results. Check your internet connection or symbols.")
+        return
+
+    name = {1: "Momentum crossover", 2: "Pullback in trend"}[args.strategy]
+    print(f"\nStrategy {args.strategy}: {name}" + ("  [DEMO DATA]" if args.demo else ""))
+
+    if args.backtest:
+        print(f"Hold {args.hold} x 5m candles, cost {args.cost}% per round trip\n")
+        print(pd.DataFrame(rows).fillna("").to_string(index=False))
+        if all_trades:
+            trades = pd.concat(all_trades, ignore_index=True)
+            print("\nAll symbols combined:")
+            for k, v in summarize(trades).items():
+                print(f"  {k:<15} {v}")
+            if args.csv:
+                trades.to_csv(args.csv, index=False)
+                print(f"\nTrades saved to {args.csv}")
+        print("\nReminder: ~60 days of data is a small sample. Paper-trade before going live.")
+    else:
+        print("15m = trend filter, 5m = entry. Signal shown for the last completed candle.\n")
+        print(pd.DataFrame(rows).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

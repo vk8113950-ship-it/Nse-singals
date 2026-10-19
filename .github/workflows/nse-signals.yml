@@ -5,7 +5,16 @@ on:
     # Every 5 minutes, 03:00-10:59 UTC = 08:30-16:29 IST, Monday-Friday.
     # The script itself skips anything outside 09:20-15:35 IST.
     - cron: "*/5 3-10 * * 1-5"
-  workflow_dispatch:        # lets you press "Run workflow" to send a test message
+  workflow_dispatch:        # "Run workflow" button for manual tests
+    inputs:
+      mode:
+        description: "What should this manual run do?"
+        type: choice
+        default: snapshot
+        options:
+          - snapshot        # send current status of every stock to Telegram
+          - signals         # check for new BUY/SELL signals now (even outside market hours)
+          - test            # just send a "connected" message
 
 permissions:
   contents: read
@@ -41,18 +50,25 @@ jobs:
           key: sent-signals-${{ github.run_id }}
           restore-keys: sent-signals-
 
-      - name: Send test message (manual runs only)
-        if: github.event_name == 'workflow_dispatch'
-        run: python nse_signal_agent.py --test-alert
+      - name: Manual - test message
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'test'
+        run: python nse_signal_agent.py --test-alert ${SYMBOLS:+--symbols $SYMBOLS}
 
-      - name: Scan and alert
+      - name: Manual - snapshot of all stocks
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'snapshot'
+        run: python nse_signal_agent.py --snapshot --strategy "$STRATEGY" ${SYMBOLS:+--symbols $SYMBOLS}
+
+      - name: Manual - check signals now
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'signals'
+        run: python nse_signal_agent.py --alert --force --strategy "$STRATEGY" ${SYMBOLS:+--symbols $SYMBOLS}
+
+      - name: Scheduled - scan and alert
         if: github.event_name == 'schedule'
         run: python nse_signal_agent.py --alert --strategy "$STRATEGY" ${SYMBOLS:+--symbols $SYMBOLS}
 
       - name: Save list of alerts already sent
-        if: github.event_name == 'schedule' && always()
+        if: always() && (github.event_name == 'schedule' || inputs.mode == 'signals')
         uses: actions/cache/save@v4
         with:
           path: sent_signals.json
           key: sent-signals-${{ github.run_id }}
-          

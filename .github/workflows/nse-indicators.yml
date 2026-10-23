@@ -1,0 +1,43 @@
+name: NSE indicator updates
+
+# No GitHub timer here on purpose: cron-job.org starts this workflow on time,
+# and runs started that way are never auto-disabled by GitHub.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What should this run do?"
+        type: choice
+        default: update-now
+        options:
+          - update-now         # manual: latest indicator update right now
+          - summary-now        # manual: today's day summary so far
+          - test               # manual: Telegram connection test
+          - scheduled          # used by cron-job.org (every 30 min)
+          - scheduled-summary  # used by cron-job.org (16:10)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nse-indicators
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet pandas numpy
+
+      - name: Run indicator bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python indicator_bot.py --mode "${{ inputs.mode }}"

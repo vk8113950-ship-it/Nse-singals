@@ -1,0 +1,39 @@
+name: Backtest new ideas
+
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "How many months of history to test"
+        type: choice
+        default: "24"
+        options: ["12", "24", "36"]
+      cost:
+        description: "Round-trip cost per trade in % (brokerage + STT + charges)"
+        default: "0.08"
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pandas numpy
+      - name: Run backtest of new ideas
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python strategies.py --months "${{ inputs.months }}" --cost "${{ inputs.cost }}"
+      - name: Save every trade as a downloadable CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-trades
+          path: strategy_trades.csv
+          if-no-files-found: ignore
